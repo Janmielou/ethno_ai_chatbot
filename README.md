@@ -1,4 +1,4 @@
-# Arcana Herbarium – Mindanao Ethnomedicinal Plant Chatbot
+# Mindanao Ethnomedicinal Plant Chatbot
 
 A local, console-based chatbot that answers questions about ethnomedicinal plants recorded in Mindanao, Philippines.  
 The chatbot only uses the **CSV dataset** as its source of truth and refuses to guess outside the dataset.
