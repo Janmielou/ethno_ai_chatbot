@@ -5,10 +5,11 @@
 #   2. Provide clean, deterministic lookups on the CSV (no AI, no guessing).
 #   3. Build and query a Chroma vector database for semantic search.
 #
-# This module is used by main.py for:
+# Used by main.py for:
 #   - Getting all known plant names (local + scientific).
 #   - Fetching all rows for a specific plant.
 #   - Searching by disease/condition keywords.
+#   - Searching by parts used.
 #   - Supplying semantic-retrieval documents to the LLM.
 #   - Providing a dataset vocabulary for scope checking.
 # -------------------------------------------------------------------
@@ -20,25 +21,40 @@ import re
 from typing import List, Dict, Set
 
 import pandas as pd
-from langchain_ollama import OllamaEmbeddings
+from sentence_transformers import SentenceTransformer
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+
 
 # ===============================================================
 # 0. CONFIGURATION
 # ===============================================================
 
-# Absolute path to your ethnomedicinal plant dataset
-CSV_PATH: str = r"C:/Desktop/ai_chatbot/datasets/Mindanao_Ethnomedicinal_Plant_Dataset.csv"
+# You can optionally override these via environment variables:
+#   ETHNO_DATASET_CSV_PATH
+#   ETHNO_CHROMA_DIR
+#   ETHNO_CHROMA_COLLECTION
+#
+# If not set, these defaults are used.
 
-# Directory on disk where Chroma will store the vector index
-CHROMA_DIR: str = "./chroma_mindanao_ethno_db"
+CSV_PATH: str = os.getenv(
+    "ETHNO_DATASET_CSV_PATH",
+    r"C:/Desktop/improved_ethno_ai_chatbot/datasets/Mindanao_Ethnomedicinal_Plant_Dataset.csv",
+)
 
-# Name for the Chroma collection (just an identifier)
-CHROMA_COLLECTION_NAME: str = "Mindanao_Ethnomedicinal_2025"
+CHROMA_DIR: str = os.getenv(
+    "ETHNO_CHROMA_DIR",
+    "./chroma_mindanao_ethno_db",
+)
 
-# Name of the Ollama embedding model to use
-EMBED_MODEL_NAME: str = "mxbai-embed-large"
+CHROMA_COLLECTION_NAME: str = os.getenv(
+    "ETHNO_CHROMA_COLLECTION",
+    "Mindanao_Ethnomedicinal_2025",
+)
+
+# Sentence-transformers model (multilingual)
+EMBED_MODEL_NAME: str = "paraphrase-multilingual-MiniLM-L12-v2"
 
 
 # ===============================================================
@@ -72,9 +88,7 @@ def sci_genus_species_normalized(s: str) -> str:
         "Andrographis paniculata (Burm. f.) Nees"
             -> "andrographis paniculata"
     """
-    # Keep letters and spaces only
     s = re.sub(r"[^a-zA-Z\s]", " ", str(s))
-    # Collapse repeated spaces and lowercase
     s = re.sub(r"\s+", " ", s).strip().lower()
     parts = s.split()
     if len(parts) >= 2:
@@ -104,13 +118,51 @@ def sci_genus_species(s: str) -> str:
 # 2. LOAD CSV INTO DATAFRAME
 # ===============================================================
 
-# Read CSV into a pandas DataFrame
-df: pd.DataFrame = pd.read_csv(CSV_PATH)
+def _load_csv(path: str) -> pd.DataFrame:
+    """
+    Load the ethnomedicinal CSV with basic validation and
+    friendly error messages if something is wrong.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"[vector.py] CSV dataset not found at:\n  {path}\n\n"
+            f"Please check that the file exists or set ETHNO_DATASET_CSV_PATH."
+        )
 
-# Strip trailing spaces from headers like "Family " -> "Family"
-df.columns = [c.strip() for c in df.columns]
+    df = pd.read_csv(path)
 
-# Column name constants (after stripping spaces)
+    # Strip trailing spaces from headers like "Family " -> "Family"
+    df.columns = [c.strip() for c in df.columns]
+
+    required_cols = [
+        "Scientific Name",
+        "Family",
+        "Local Name",
+        "Disease used on",
+        "Parts used",
+        "Preparation and Administration",
+        "Quality of Dosage",
+        "Administration Frequency",
+        "Experienced adverse or side effects",
+        "Literature taken from",
+        "Page where the data can be found on the literature",
+    ]
+
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "[vector.py] CSV is missing required columns:\n"
+            f"  {', '.join(missing)}\n\n"
+            "Please make sure you are using the correct dataset version."
+        )
+
+    return df
+
+
+# Global DataFrame (loaded once)
+df: pd.DataFrame = _load_csv(CSV_PATH)
+
+# Column name constants
 COL_SCI: str = "Scientific Name"
 COL_FAMILY: str = "Family"
 COL_LOCAL: str = "Local Name"
@@ -141,14 +193,11 @@ df["_gs"] = df[COL_SCI].astype(str).apply(sci_genus_species_normalized)
 # 3. KNOWN PLANT NAMES (for quick existence checks)
 # ===============================================================
 
-# This set contains *all* distinct local and scientific names
-# (as they appear in the CSV, but lowercased).
 KNOWN_PLANT_NAMES: Set[str] = set()
 
 for _, row in df.iterrows():
     local = str(row[COL_LOCAL]).strip().lower()
     sci = str(row[COL_SCI]).strip().lower()
-
     if local:
         KNOWN_PLANT_NAMES.add(local)
     if sci:
@@ -158,9 +207,62 @@ for _, row in df.iterrows():
 def get_known_plant_names() -> Set[str]:
     """
     Return the set of all plant names (local + scientific)
-    that actually appear in the dataset.
+    that actually appear in the dataset (lowercased).
     """
     return KNOWN_PLANT_NAMES
+
+
+def get_name_to_scientific_map() -> Dict[str, str]:
+    """
+    Build a dictionary mapping many possible name variants to the
+    canonical scientific name exactly as it appears in the CSV.
+
+    Keys are all lowercase and include:
+      - the full scientific name
+      - the 'Genus species' form of the scientific name
+      - a compact normalized scientific name (no spaces / hyphens)
+      - the local name
+      - compact normalized local name
+      - simple hyphen/space variants of the local name
+
+    This lets the chatbot recognize queries like 'what is tanglad',
+    'tawa tawa', 'tawatawa', etc. for any plant present in the CSV.
+    """
+    mapping: Dict[str, str] = {}
+
+    for _, row in df.iterrows():
+        sci = str(row[COL_SCI]).strip()
+        local = str(row[COL_LOCAL]).strip()
+
+        if not sci:
+            continue
+
+        canonical = sci  # scientific name exactly as in the CSV
+        aliases: Set[str] = set()
+
+        # ---- scientific name variants ----
+        sci_lower = sci.lower()
+        aliases.add(sci_lower)
+        aliases.add(normalize_name(sci))       # no spaces/hyphens
+        aliases.add(sci_genus_species(sci))    # genus + species only
+
+        # ---- local name variants ----
+        if local:
+            lower_local = local.lower().strip()
+            if lower_local:
+                aliases.add(lower_local)
+                aliases.add(normalize_name(local))         # no spaces/hyphens
+                aliases.add(lower_local.replace("-", " ")) # "tawa-tawa" -> "tawa tawa"
+                aliases.add(lower_local.replace(" ", ""))  # "tawa tawa" -> "tawatawa"
+
+        # register all aliases → canonical sci name
+        for alias in aliases:
+            key = alias.strip().lower()
+            if not key:
+                continue
+            mapping.setdefault(key, canonical)
+
+    return mapping
 
 
 # ===============================================================
@@ -185,19 +287,34 @@ def _normalize_sci_name_for_match(s: str) -> str:
         return f"{parts[0]} {parts[1]}".lower()
     return s.lower()
 
-def get_raw_records_for_name(name: str) -> list[dict]:
-    """
-    Return ALL CSV rows that belong to the same plant,
-    treating different author formats (L., Linn., etc.) as the same
-    if they share the same Genus + species.
-    """
-    target = _normalize_sci_name_for_match(name)
 
-    mask = df["Scientific Name"].apply(
+def get_raw_records_for_name(name: str) -> List[Dict]:
+    """
+    Return ALL CSV rows that belong to the same plant.
+
+    Supports:
+      - Scientific names (full or 'Genus species')
+      - Local names (e.g. 'tanglad', 'lagundi')
+
+    It first tries to match by scientific name.
+    If nothing is found, it will automatically try the Local Name column.
+    """
+    if not name:
+        return []
+
+    # 1) Try to match as scientific name (Genus + species)
+    target = _normalize_sci_name_for_match(name)
+    sci_mask = df[COL_SCI].apply(
         lambda x: _normalize_sci_name_for_match(x) == target
     )
+    rows = df[sci_mask]
 
-    rows = df[mask]
+    # 2) If nothing found, try to match as LOCAL NAME (normalized)
+    if rows.empty:
+        local_target = normalize_name(name)
+        local_mask = df["_local_norm"] == local_target
+        rows = df[local_mask]
+
     return rows.to_dict(orient="records")
 
 
@@ -212,20 +329,15 @@ def search_records_by_disease_keywords(keywords: List[str]) -> List[Dict]:
     if not keywords:
         return []
 
-    # Lowercase keywords once
     lowered = [kw.lower() for kw in keywords]
-
-    # Lowercase disease column once
     series = df[COL_DISEASE].astype(str).str.lower()
 
     def matches(text: str) -> bool:
-        # True if ANY keyword appears as substring in text
         return any(kw in text for kw in lowered)
 
     mask = series.apply(matches)
+    return [row.to_dict() for _, row in df[mask].iterrows()]
 
-    records: List[Dict] = [row.to_dict() for _, row in df[mask].iterrows()]
-    return records
 
 def search_records_by_parts_keywords(keywords: List[str]) -> List[Dict]:
     """
@@ -249,19 +361,19 @@ def search_records_by_parts_keywords(keywords: List[str]) -> List[Dict]:
     return [row.to_dict() for _, row in df[mask].iterrows()]
 
 
-
 def get_all_disease_phrases() -> List[str]:
     """
     Extract all DISTINCT disease phrases from the 'Disease used on' column.
 
     We split on common separators ; , and /, then trim whitespace and
     deduplicate the resulting pieces.
+
+    Returned phrases are lowercased.
     """
     phrases: Set[str] = set()
     series = df[COL_DISEASE].astype(str).str.lower()
 
     for text in series:
-        # Split by semicolon, comma, or slash
         parts = re.split(r"[;,/]", text)
         for part in parts:
             p = part.strip()
@@ -275,42 +387,68 @@ def get_all_disease_phrases() -> List[str]:
 # 5. EMBEDDINGS + CHROMA VECTOR STORE
 # ===============================================================
 
-# Create an embedding model instance backed by Ollama
-embeddings = OllamaEmbeddings(model=EMBED_MODEL_NAME)
+class SBERTEmbeddings(Embeddings):
+    """
+    Wrapper around SentenceTransformer so that Chroma can call
+    embed_documents() and embed_query() like it expects.
+    """
+
+    def __init__(self, model_name: str):
+        self._model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        embs = self._model.encode(
+            texts,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        return embs.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        emb = self._model.encode(
+            [text],
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )[0]
+        return emb.tolist()
+
+
+# Single embeddings instance used by Chroma
+embeddings = SBERTEmbeddings(EMBED_MODEL_NAME)
 
 # Decide if we need to build the Chroma index or just reuse it
 add_docs: bool = not os.path.exists(CHROMA_DIR)
 
 if add_docs:
-    # We will build a document list from every CSV row
     docs: List[Document] = []
     ids: List[str] = []
 
     for i, row in df.iterrows():
-        # Combine the relevant CSV fields into a single text blob.
-        # This is what the embedding model will actually "see".
         page_content = (
             f"Local Name: {row[COL_LOCAL]}\n"
             f"Scientific Name: {row[COL_SCI]}\n"
+            f"Family: {row[COL_FAMILY]}\n"
             f"Disease used on: {row[COL_DISEASE]}\n"
+            f"Parts used: {row[COL_PARTS]}\n"
             f"Preparation and Administration: {row[COL_PREP]}\n"
             f"Quality of Dosage: {row[COL_QTY]}\n"
             f"Administration Frequency: {row[COL_FREQ]}\n"
-            f"Family: {row[COL_FAMILY]}\n"
-            f"Parts used: {row[COL_PARTS]}\n"
             f"Experienced adverse or side effects: {row[COL_SIDE]}\n"
             f"Literature taken from: {row[COL_LIT]}\n"
             f"Page where the data can be found on the literature: {row[COL_PAGE]}\n"
         )
 
-        # Each row becomes one Document with metadata for later use
         doc = Document(
             page_content=page_content,
             metadata={
                 "Local Name": row[COL_LOCAL],
                 "Scientific Name": row[COL_SCI],
                 "Family": row[COL_FAMILY],
+                "Disease used on": row[COL_DISEASE],
                 "Parts used": row[COL_PARTS],
+                "Preparation and Administration": row[COL_PREP],
+                "Quality of Dosage": row[COL_QTY],
+                "Administration Frequency": row[COL_FREQ],
                 "Experienced adverse or side effects": row[COL_SIDE],
                 "Literature taken from": row[COL_LIT],
                 "Page where the data can be found on the literature": row[COL_PAGE],
@@ -341,25 +479,28 @@ def retrieve_with_threshold(
     """
     Retrieve documents from the vector store based on semantic similarity.
 
-    Parameters:
-        query           – the natural-language query string
-        k               – how many top documents to request from Chroma
-        score_threshold – minimal similarity score to keep a document
+    For Chroma, the score is usually a *distance*:
+      lower = more similar, higher = less similar.
 
-    Returns:
-        A list of Document objects representing the most relevant
-        dataset rows, filtered by score_threshold.
+    Behavior:
+      - Keep docs with score <= score_threshold.
+      - If that gives nothing, fall back to returning the top-k docs
+        so the chatbot always has something to work with.
     """
     results = vector_store.similarity_search_with_score(query=query, k=k)
 
-    # NOTE:
-    # Depending on how the underlying distance is defined, "score"
-    # might be a similarity (higher = better) or a distance (lower = better).
-    # In langchain_chroma's default setup with embeddings, higher scores
-    # typically mean "more similar", which is what we assume here.
+    if not results:
+        return []
+
+    # score is a distance: LOWER = closer
     filtered_docs: List[Document] = [
-        doc for doc, score in results if score >= score_threshold
+        doc for doc, score in results if score <= score_threshold
     ]
+
+    # If threshold was too strict, just return the top-k docs
+    if not filtered_docs:
+        filtered_docs = [doc for doc, _ in results]
+
     return filtered_docs
 
 
@@ -409,14 +550,11 @@ def _build_dataset_vocabulary() -> Set[str]:
         if col not in df.columns:
             continue
 
-        # Drop NaN, cast to string
         series = df[col].dropna().astype(str)
 
         for text in series:
-            # Split on non-word characters, lowercase tokens
             for tok in re.split(r"[^\w]+", text.lower()):
                 tok = tok.strip()
-                # Ignore very short tokens (like "of", "to", etc.)
                 if len(tok) < 3:
                     continue
                 vocab.add(tok)
@@ -434,3 +572,14 @@ def get_dataset_vocabulary() -> Set[str]:
     in the core dataset columns.
     """
     return _DATASET_VOCAB
+
+
+if __name__ == "__main__":
+    # Tiny self-check you can run with:
+    #   python vector.py
+    print("[vector.py] Loaded rows:", len(df))
+    print("[vector.py] Example known names (first 10):")
+    for i, name in enumerate(sorted(KNOWN_PLANT_NAMES)):
+        if i >= 10:
+            break
+        print("  -", name)
