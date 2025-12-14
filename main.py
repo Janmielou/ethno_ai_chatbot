@@ -1,4 +1,4 @@
-# main.py – Arcana Herbarium Chatbot (cleaned + improved)
+# main.py – Arcana Herbarium Chatbot 
 # ============================================================
 # Ethnomedicinal Plant Chatbot (Mindanao, Philippines)
 #
@@ -1828,3 +1828,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
